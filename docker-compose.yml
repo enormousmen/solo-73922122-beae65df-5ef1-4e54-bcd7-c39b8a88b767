@@ -1,0 +1,21 @@
+services:
+  canary-api:
+    build: .
+    image: canary-rollout-api:1.0.0
+    container_name: canary-rollout-api
+    ports:
+      - "8000:8000"
+    environment:
+      CANARY_DB_PATH: /data/canary.db
+    volumes:
+      - canary-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  canary-data:
