@@ -12,6 +12,22 @@ Guarantees:
 * Pause/hold decisions do not consume a generation: operators may keep
   observing the same generation and re-evaluate later. Promote, rollback and
   complete decisions do consume it (the generation advances on execution).
+
+Concurrency model:
+* ``/evaluate`` scans the (potentially large) observation tables in a lock-free
+  WAL snapshot transaction (``read_tx``), so ingestion and execution callbacks
+  of every rollout keep committing while the scan runs. Only the final
+  read-modify-write takes the serialised write lock, and only for a handful of
+  indexed point queries.
+* Before a decision is persisted, the commit transaction re-validates that the
+  rollout state tuple and the evaluated generation's valid-observation
+  fingerprint (largest appended row id per observation table) are unchanged
+  since the snapshot. A concurrent *valid* observation or a state change on
+  the same rollout invalidates the attempt: evaluation re-snapshots and
+  recomputes (and, if the conflict keeps recurring, returns HTTP 409 asking the
+  caller to retry without writing any decision). Stale-generation reports and
+  writes belonging to other rollouts cannot change the fingerprint and
+  therefore never cause a retry.
 """
 from __future__ import annotations
 
@@ -21,7 +37,7 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from .db import utcnow, write_tx, get_conn
+from .db import utcnow, write_tx, get_conn, read_tx
 from .models import (
     ACTION_COMPLETE,
     ACTION_PAUSE,
@@ -42,6 +58,20 @@ TERMINAL_STATUSES = {"completed", "rolled_back", "failed"}
 PROMOTED_STATUSES = {"promoting", "paused"}
 # Decisions that consume a generation.
 GENERATION_CONSUMING = {ACTION_PROMOTE, ACTION_ROLLBACK, ACTION_COMPLETE}
+
+# Optimistic-concurrency bound for a single /evaluate call: each conflicting
+# commit restarts the snapshot + recompute once, after which the caller gets a
+# 409 and may retry the whole request.
+MAX_EVALUATION_ATTEMPTS = 3
+
+# Test seam: when set, called as ``hook(rollout_id, attempt, plan)`` after the
+# lock-free snapshot scan and before the commit transaction, so tests can
+# deterministically interleave competing writes. Not referenced by any route.
+_SNAPSHOT_HOOK = None
+
+
+class StaleEvaluation(Exception):
+    """Raised inside the commit tx when the evaluation basis has changed."""
 
 
 # ---------------------------------------------------------------------------
@@ -359,52 +389,109 @@ def ingest_metrics(rollout_id: str, req: WindowMetricsRequest) -> dict:
 
 # ---------------------------------------------------------------------------
 # observation aggregation (current generation, non-ignored rows only)
+#
+# All helpers run on whatever connection they are given. During evaluation the
+# callers pass a lock-free read_tx snapshot connection, so scanning a large
+# observation history never holds the write lock.
 # ---------------------------------------------------------------------------
+
+# Release columns that feed (or guard) a decision. ``updated_at`` is excluded:
+# valid ingestion bumps it, but only the observation fingerprint must react to
+# that. Immutable config columns are included so the tuple also certifies that
+# the exact rollout configuration seen in the snapshot is still in force.
+_STATE_TUPLE_COLS = (
+    "status",
+    "current_generation",
+    "current_replicas",
+    "pending_decision_id",
+    "last_decision_id",
+    "failure_message",
+    "total_replicas",
+    "max_replicas_per_batch",
+    "min_stable_window_seconds",
+    "error_rate_threshold",
+)
+
+
+def _state_tuple(rollout) -> tuple:
+    return tuple(rollout[c] for c in _STATE_TUPLE_COLS)
+
+
+def _observation_fingerprint(conn, rollout_id: str, generation: int) -> tuple:
+    """(replica_max_id, metric_max_id) over the generation's valid rows.
+
+    The observation tables are append-only: rows are inserted and never
+    updated or deleted, so the largest row id is a sufficient change token --
+    any new valid observation raises it, while stale (ignored) backfills and
+    other rollouts' writes cannot. With the covering fingerprint indexes the
+    two ``MAX(id)`` lookups are O(log n) point queries, keeping the commit
+    transaction short regardless of the accumulated history.
+    """
+    replica = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0) AS max_id
+        FROM replica_reports
+        WHERE rollout_id = ? AND generation = ? AND ignored = 0
+        """,
+        (rollout_id, generation),
+    ).fetchone()
+    metrics = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0) AS max_id
+        FROM metric_windows
+        WHERE rollout_id = ? AND generation = ? AND ignored = 0
+        """,
+        (rollout_id, generation),
+    ).fetchone()
+    return (replica["max_id"], metrics["max_id"])
+
 
 def _current_replica_states(conn, rollout_id: str, generation: int) -> dict[str, str]:
     """Latest reported state per replica for the given generation."""
     rows = conn.execute(
         """
-        SELECT replica_id, MAX(id) AS max_id
-        FROM replica_reports
-        WHERE rollout_id = ? AND generation = ? AND ignored = 0
-        GROUP BY replica_id
+        SELECT r.replica_id, r.state
+        FROM replica_reports AS r
+        JOIN (
+            SELECT replica_id, MAX(id) AS max_id
+            FROM replica_reports
+            WHERE rollout_id = ? AND generation = ? AND ignored = 0
+            GROUP BY replica_id
+        ) AS latest
+          ON latest.max_id = r.id
         """,
         (rollout_id, generation),
     ).fetchall()
-    latest: dict[str, str] = {}
-    for r in rows:
-        detail = conn.execute(
-            "SELECT state FROM replica_reports WHERE id = ?", (r["max_id"],)
-        ).fetchone()
-        latest[r["replica_id"]] = detail["state"]
-    return latest
+    return {r["replica_id"]: r["state"] for r in rows}
 
 
 def _current_metrics(conn, rollout_id: str, generation: int) -> dict:
     """Aggregate metrics for one generation.
 
     Window length is the longest single reported window; the caller decides
-    whether it covers the minimum stable window.
+    whether it covers the minimum stable window. The summation happens inside
+    SQLite so the scan does not load every window row into Python.
     """
-    rows = conn.execute(
+    agg = conn.execute(
         """
-        SELECT window_seconds, request_count, error_count
+        SELECT COUNT(*) AS window_count,
+               COALESCE(SUM(request_count), 0) AS total_requests,
+               COALESCE(SUM(error_count), 0) AS total_errors,
+               COALESCE(MAX(window_seconds), 0.0) AS max_window_seconds
         FROM metric_windows
         WHERE rollout_id = ? AND generation = ? AND ignored = 0
-        ORDER BY id
         """,
         (rollout_id, generation),
-    ).fetchall()
-    total_requests = sum(r["request_count"] for r in rows)
-    total_errors = sum(r["error_count"] for r in rows)
+    ).fetchone()
+    total_requests = agg["total_requests"]
+    total_errors = agg["total_errors"]
     error_rate = (total_errors / total_requests) if total_requests else 0.0
     return {
-        "window_count": len(rows),
+        "window_count": agg["window_count"],
         "total_requests": total_requests,
         "total_errors": total_errors,
         "error_rate": error_rate,
-        "max_window_seconds": max((r["window_seconds"] for r in rows), default=0.0),
+        "max_window_seconds": agg["max_window_seconds"],
     }
 
 
@@ -412,166 +499,239 @@ def _current_metrics(conn, rollout_id: str, generation: int) -> dict:
 # evaluation / decisions
 # ---------------------------------------------------------------------------
 
-def evaluate(rollout_id: str) -> dict:
-    """Make at most one new decision from the current generation's data.
+def _snapshot_evaluation_basis(conn, rollout) -> dict:
+    """Read everything a decision depends on from one consistent snapshot."""
+    rollout_id = rollout["id"]
+    generation = rollout["current_generation"]
+    replicas = _current_replica_states(conn, rollout_id, generation)
+    metrics = _current_metrics(conn, rollout_id, generation)
+    return {
+        "rollout": rollout_view(rollout),
+        "state_tuple": _state_tuple(rollout),
+        "fingerprint": _observation_fingerprint(conn, rollout_id, generation),
+        "generation": generation,
+        "generation_consumed": _generation_consumed(conn, rollout_id, generation),
+        "replicas": replicas,
+        "metrics": metrics,
+        "ready": sum(1 for s in replicas.values() if s == "ready"),
+        "unready": sum(1 for s in replicas.values() if s == "unready"),
+    }
+
+
+def _compute_decision(basis: dict) -> dict:
+    """Pure decision computation over a snapshot; performs no I/O.
 
     Priority: rollback (threshold breach) > complete > promote > hold(pause).
-    Hold/pause decisions do not consume the generation.
+    Hold/pause decisions do not consume the generation. The rules are the same
+    as in the original single-transaction implementation.
     """
-    with write_tx() as conn:
-        rollout = _get_rollout(conn, rollout_id)
-        view = rollout_view(rollout)
+    rollout = basis["rollout"]
+    generation = basis["generation"]
+    metrics = basis["metrics"]
+    ready = basis["ready"]
+    unready = basis["unready"]
+    from_replicas = rollout["current_replicas"]
+    threshold = rollout["error_rate_threshold"]
+    min_window = rollout["min_stable_window_seconds"]
+    total = rollout["total_replicas"]
+    batch_cap = rollout["max_replicas_per_batch"]
+    to_replicas = min(total, from_replicas + batch_cap)
 
-        if rollout["pending_decision_id"]:
-            pending = conn.execute(
-                "SELECT * FROM decisions WHERE id = ?",
-                (rollout["pending_decision_id"],),
-            ).fetchone()
-            return {
-                "rollout": view,
-                "decision": decision_view(pending),
-                "evaluated": False,
-                "message": (
-                    "a decision is already pending execution; report its result "
-                    "before evaluating again"
-                ),
-            }
+    detail = {
+        "generation": generation,
+        "ready_replicas": ready,
+        "unready_replicas": unready,
+        "reported_replicas": len(basis["replicas"]),
+        "committed_replicas": from_replicas,
+        "metrics": metrics,
+        "threshold": threshold,
+        "min_stable_window_seconds": min_window,
+    }
 
-        if rollout["status"] in TERMINAL_STATUSES:
-            return {
-                "rollout": view,
-                "decision": None,
-                "evaluated": False,
-                "message": f"rollout is terminal ({rollout['status']})",
-            }
-
-        generation = rollout["current_generation"]
-        if _generation_consumed(conn, rollout_id, generation):
-            return {
-                "rollout": view,
-                "decision": None,
-                "evaluated": False,
-                "message": (
-                    f"generation {generation} already has a committed "
-                    "promote/rollback/complete decision"
-                ),
-            }
-
-        replicas = _current_replica_states(conn, rollout_id, generation)
-        metrics = _current_metrics(conn, rollout_id, generation)
-        ready = sum(1 for s in replicas.values() if s == "ready")
-        unready = sum(1 for s in replicas.values() if s == "unready")
-        from_replicas = rollout["current_replicas"]
-        threshold = rollout["error_rate_threshold"]
-        min_window = rollout["min_stable_window_seconds"]
-        total = rollout["total_replicas"]
-        batch_cap = rollout["max_replicas_per_batch"]
-        to_replicas = min(total, from_replicas + batch_cap)
-
-        detail = {
-            "generation": generation,
-            "ready_replicas": ready,
-            "unready_replicas": unready,
-            "reported_replicas": len(replicas),
-            "committed_replicas": from_replicas,
-            "metrics": metrics,
-            "threshold": threshold,
-            "min_stable_window_seconds": min_window,
-        }
-
-        # 1) Hard rollback on error-rate threshold breach (needs real traffic).
-        if metrics["total_requests"] > 0 and metrics["error_rate"] > threshold:
-            reason = (
+    # 1) Hard rollback on error-rate threshold breach (needs real traffic).
+    if metrics["total_requests"] > 0 and metrics["error_rate"] > threshold:
+        return {
+            "action": ACTION_ROLLBACK,
+            "from_replicas": from_replicas,
+            "to_replicas": 0,
+            "reason": (
                 f"error rate {metrics['error_rate']:.4f} exceeds threshold "
                 f"{threshold:.4f}"
-            )
-            decision_id = _insert_decision(
-                conn, rollout_id, generation, ACTION_ROLLBACK,
-                from_replicas, 0, reason, detail,
-            )
-            conn.execute(
-                """
-                UPDATE releases
-                SET pending_decision_id = ?, last_decision_id = ?,
-                    failure_message = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (decision_id, decision_id, reason, utcnow(), rollout_id),
-            )
-            return _eval_response(conn, rollout_id, decision_id, reason)
+            ),
+            "detail": detail,
+        }
 
-        # 2) Completion: last batch took effect, every replica ready.
-        if (
-            rollout["status"] in PROMOTED_STATUSES
-            and from_replicas >= total
-            and ready >= total
-            and unready == 0
-            and metrics["max_window_seconds"] >= min_window
-        ):
-            reason = (
+    # 2) Completion: last batch took effect, every replica ready.
+    if (
+        rollout["status"] in PROMOTED_STATUSES
+        and from_replicas >= total
+        and ready >= total
+        and unready == 0
+        and metrics["max_window_seconds"] >= min_window
+    ):
+        return {
+            "action": ACTION_COMPLETE,
+            "from_replicas": from_replicas,
+            "to_replicas": total,
+            "reason": (
                 f"all {total} replicas ready on target version with a stable window"
-            )
-            decision_id = _insert_decision(
-                conn, rollout_id, generation, ACTION_COMPLETE,
-                from_replicas, total, reason, detail,
-                execution_status=EXEC_NOT_REQUIRED,
-            )
-            now = utcnow()
-            conn.execute(
-                """
-                UPDATE releases
-                SET status = 'completed', pending_decision_id = NULL,
-                    last_decision_id = ?, failure_message = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                (decision_id, now, rollout_id),
-            )
-            conn.execute(
-                "UPDATE decisions SET executed_at = ? WHERE id = ?",
-                (now, decision_id),
-            )
-            return _eval_response(conn, rollout_id, decision_id, reason)
+            ),
+            "detail": detail,
+        }
 
-        # 3) Promote: stable window, all-ready, cap not yet reached.
-        window_ok = metrics["max_window_seconds"] >= min_window
-        healthy = unready == 0
-        if window_ok and healthy and from_replicas < total:
-            reason = (
+    # 3) Promote: stable window, all-ready, cap not yet reached.
+    window_ok = metrics["max_window_seconds"] >= min_window
+    healthy = unready == 0
+    if window_ok and healthy and from_replicas < total:
+        return {
+            "action": ACTION_PROMOTE,
+            "from_replicas": from_replicas,
+            "to_replicas": to_replicas,
+            "reason": (
                 f"stable for {metrics['max_window_seconds']:.0f}s "
                 f"(>= {min_window}s) with error rate "
                 f"{metrics['error_rate']:.4f} <= {threshold:.4f}; "
                 f"promote {from_replicas} -> {to_replicas} replicas"
-            )
-            decision_id = _insert_decision(
-                conn, rollout_id, generation, ACTION_PROMOTE,
-                from_replicas, to_replicas, reason, detail,
-            )
-            conn.execute(
-                """
-                UPDATE releases
-                SET pending_decision_id = ?, last_decision_id = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (decision_id, decision_id, utcnow(), rollout_id),
-            )
-            return _eval_response(conn, rollout_id, decision_id, reason)
+            ),
+            "detail": detail,
+        }
 
-        # 4) Otherwise hold (pause) and explain what is blocking promotion.
-        blockers = []
-        if not window_ok:
-            blockers.append(
-                f"no window of {min_window}s yet "
-                f"(best {metrics['max_window_seconds']:.0f}s)"
+    # 4) Otherwise hold (pause) and explain what is blocking promotion.
+    blockers = []
+    if not window_ok:
+        blockers.append(
+            f"no window of {min_window}s yet "
+            f"(best {metrics['max_window_seconds']:.0f}s)"
+        )
+    if not healthy:
+        blockers.append(f"{unready} unready replica(s)")
+    if metrics["total_requests"] == 0:
+        blockers.append("no traffic metrics reported")
+    return {
+        "action": ACTION_PAUSE,
+        "from_replicas": from_replicas,
+        "to_replicas": from_replicas,
+        "reason": "holding: " + "; ".join(blockers) if blockers else "holding",
+        "detail": detail,
+    }
+
+
+def _no_decision_response(rollout, decision, message: str) -> dict:
+    return {
+        "rollout": rollout_view(rollout),
+        "decision": decision_view(decision) if decision is not None else None,
+        "evaluated": False,
+        "message": message,
+    }
+
+
+def evaluate(rollout_id: str) -> dict:
+    """Make at most one new decision from the current generation's data.
+
+    The observation scan runs in a lock-free WAL snapshot. Only the final
+    commit takes the write lock, and it first certifies that neither the
+    rollout state nor the evaluated generation's valid observations changed
+    since the snapshot. On conflict the evaluation restarts with a fresh
+    snapshot and recomputes; if every attempt conflicts, HTTP 409 is returned
+    without persisting anything.
+    """
+    for attempt in range(1, MAX_EVALUATION_ATTEMPTS + 1):
+        # ---- phase 1: consistent snapshot, no write lock held ----
+        with read_tx() as conn:
+            rollout = _get_rollout(conn, rollout_id)
+
+            if rollout["pending_decision_id"]:
+                pending = conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?",
+                    (rollout["pending_decision_id"],),
+                ).fetchone()
+                return _no_decision_response(
+                    rollout, pending,
+                    "a decision is already pending execution; report its result "
+                    "before evaluating again",
+                )
+
+            if rollout["status"] in TERMINAL_STATUSES:
+                return _no_decision_response(
+                    rollout, None,
+                    f"rollout is terminal ({rollout['status']})",
+                )
+
+            basis = _snapshot_evaluation_basis(conn, rollout)
+
+        if basis["generation_consumed"]:
+            return _no_decision_response(
+                rollout, None,
+                f"generation {basis['generation']} already has a committed "
+                "promote/rollback/complete decision",
             )
-        if not healthy:
-            blockers.append(f"{unready} unready replica(s)")
-        if metrics["total_requests"] == 0:
-            blockers.append("no traffic metrics reported")
-        reason = "holding: " + "; ".join(blockers) if blockers else "holding"
+
+        # ---- phase 2: compute the decision entirely in memory ----
+        plan = _compute_decision(basis)
+
+        if _SNAPSHOT_HOOK is not None:
+            _SNAPSHOT_HOOK(rollout_id, attempt, plan)
+
+        # ---- phase 3: short write tx with optimistic validation ----
+        try:
+            with write_tx() as conn:
+                current = _get_rollout(conn, rollout_id)
+                if _state_tuple(current) != basis["state_tuple"]:
+                    raise StaleEvaluation("rollout state changed during evaluation")
+                fingerprint = _observation_fingerprint(
+                    conn, rollout_id, basis["generation"]
+                )
+                if fingerprint != basis["fingerprint"]:
+                    raise StaleEvaluation(
+                        "new valid observations arrived during evaluation"
+                    )
+                return _persist_decision(conn, rollout_id, basis, plan)
+        except StaleEvaluation:
+            if attempt >= MAX_EVALUATION_ATTEMPTS:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "rollout state or valid observations changed while "
+                        "evaluating; no decision was written, please retry"
+                    ),
+                )
+            # Re-snapshot and recompute against the newer state/observations.
+            continue
+
+    # Unreachable: the loop either returns or raises 409.
+    raise RuntimeError("evaluation retry loop exited without a result")
+
+
+def _persist_decision(conn, rollout_id: str, basis: dict, plan: dict) -> dict:
+    """Insert the computed decision and update the release row atomically."""
+    generation = basis["generation"]
+    action = plan["action"]
+    reason = plan["reason"]
+
+    if action == ACTION_COMPLETE:
+        decision_id = _insert_decision(
+            conn, rollout_id, generation, ACTION_COMPLETE,
+            plan["from_replicas"], plan["to_replicas"], reason, plan["detail"],
+            execution_status=EXEC_NOT_REQUIRED,
+        )
+        now = utcnow()
+        conn.execute(
+            """
+            UPDATE releases
+            SET status = 'completed', pending_decision_id = NULL,
+                last_decision_id = ?, failure_message = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (decision_id, now, rollout_id),
+        )
+        conn.execute(
+            "UPDATE decisions SET executed_at = ? WHERE id = ?",
+            (now, decision_id),
+        )
+    elif action == ACTION_PAUSE:
         decision_id = _insert_decision(
             conn, rollout_id, generation, ACTION_PAUSE,
-            from_replicas, from_replicas, reason, detail,
+            plan["from_replicas"], plan["to_replicas"], reason, plan["detail"],
             execution_status=EXEC_NOT_REQUIRED,
         )
         now = utcnow()
@@ -589,7 +749,34 @@ def evaluate(rollout_id: str) -> dict:
             "UPDATE decisions SET executed_at = ? WHERE id = ?",
             (now, decision_id),
         )
-        return _eval_response(conn, rollout_id, decision_id, reason)
+    else:
+        # promote and rollback both create a pending, executable decision.
+        decision_id = _insert_decision(
+            conn, rollout_id, generation, action,
+            plan["from_replicas"], plan["to_replicas"], reason, plan["detail"],
+        )
+        if action == ACTION_ROLLBACK:
+            conn.execute(
+                """
+                UPDATE releases
+                SET pending_decision_id = ?, last_decision_id = ?,
+                    failure_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (decision_id, decision_id, reason, utcnow(), rollout_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE releases
+                SET pending_decision_id = ?, last_decision_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (decision_id, decision_id, utcnow(), rollout_id),
+            )
+
+    return _eval_response(conn, rollout_id, decision_id, reason)
 
 
 def _eval_response(conn, rollout_id: str, decision_id: str, message: str) -> dict:

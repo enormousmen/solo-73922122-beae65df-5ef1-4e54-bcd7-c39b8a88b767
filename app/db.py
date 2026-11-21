@@ -2,7 +2,9 @@
 
 All state lives in SQLite so that a process restart can resume an in-flight
 rollout. Connections are opened per request; a process-wide lock serialises
-writers and keeps decision/state transitions atomic.
+writers and keeps decision/state transitions atomic. Long read-only scans use
+``read_tx`` snapshot transactions without the write lock so ingestion and
+execution callbacks from other rollouts are never blocked by an evaluation.
 """
 from __future__ import annotations
 
@@ -52,6 +54,10 @@ CREATE TABLE IF NOT EXISTS replica_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_replica_rollout_gen
     ON replica_reports(rollout_id, generation);
+-- Covering index for the evaluation fingerprint: MAX(id) for one rollout's
+-- valid generation resolves to a single index lookup instead of a range scan.
+CREATE INDEX IF NOT EXISTS idx_replica_fingerprint
+    ON replica_reports(rollout_id, generation, ignored, id);
 
 CREATE TABLE IF NOT EXISTS metric_windows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +73,9 @@ CREATE TABLE IF NOT EXISTS metric_windows (
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_rollout_gen
     ON metric_windows(rollout_id, generation);
+-- Covering index for the evaluation fingerprint, mirroring replica_reports.
+CREATE INDEX IF NOT EXISTS idx_metrics_fingerprint
+    ON metric_windows(rollout_id, generation, ignored, id);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id TEXT PRIMARY KEY,
@@ -126,6 +135,29 @@ def get_conn(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
     conn = _connect(path)
     try:
         yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def read_tx(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
+    """Snapshot read transaction that never takes the write lock.
+
+    A plain deferred ``BEGIN`` only acquires SQLite shared/read locks. In WAL
+    mode readers see a consistent point-in-time snapshot and do not block
+    concurrent writers (observation ingestion, execution callbacks), and
+    writers do not block the scan either. Long aggregation work therefore
+    stays out of the serialised write path entirely.
+    """
+    path = db_path or DB_PATH
+    conn = _connect(path)
+    try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
